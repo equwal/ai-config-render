@@ -1,0 +1,6 @@
+# Per-machine file. Not committed. Default path: ~/.config/aicr/machine.toml
+name = "laptop"
+skip_targets = ["gemini"]
+
+[vars]
+projects = "${home}/code"

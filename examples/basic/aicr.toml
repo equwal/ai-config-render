@@ -1,0 +1,29 @@
+# Canonical config for aicr. Run: aicr diff --source examples/basic
+# ${var} comes from [vars] here or from the per-machine file (~/.config/aicr/machine.toml).
+# Built-in vars: home, home_posix, os (windows|macos|linux), machine.
+
+# Enable built-in targets (aicr list-targets shows them). Override any field here.
+[targets.claude]
+[targets.codex]
+[targets.copilot]
+[targets.gemini]
+
+# A new target is just data:
+# [targets.myagent]
+# instructions = "${home}/.myagent/RULES.md"
+# skills = ["${home}/.myagent/skills"]
+# mcp = { format = "json", path = "${home}/.myagent/mcp.json", key = "servers" }
+
+# Rules: rules/<name>.md, or rules/<name>.<target>.md for one target.
+# Filters on any rule, server, skill or file: targets = [...], machines = [...].
+[rules.style]
+[rules.testing]
+
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "${projects}"]
+
+[skills.commit-message]
+
+[vars]
+projects = "${home}/projects"
