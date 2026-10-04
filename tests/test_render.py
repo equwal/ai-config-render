@@ -79,7 +79,7 @@ def test_preserves_user_content_and_drops_removed_entries(env: tuple[Path, Path,
     assert text.startswith("# Mine\nkeep me\n") and "aicr:style" in text and "aicr:testing" not in text
     data = tomllib.loads(codex.read_text(encoding="utf-8"))
     assert data["model"] == "x" and set(data["mcp_servers"]) == {"mine", "gone"}
-    assert list(claude_md.parent.glob("CLAUDE.md.aicr-bak-*"))
+    assert list(claude_md.parent.glob("CLAUDE.md.aicr-bak"))
 
 
 def test_list_targets(capsys: pytest.CaptureFixture[str], env: tuple[Path, Path, Path]) -> None:

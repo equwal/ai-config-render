@@ -4,7 +4,18 @@ It touches only what it owns:
   - instruction files: blocks between <!-- aicr:NAME --> and <!-- /aicr:NAME -->
   - MCP configs: the server names it renders now, and the ones it rendered last run
   - skills and plain files: paths it wrote last run (tracked in a state file)
-Everything it overwrites is backed up first.
+Everything it overwrites is backed up first (one rolling <file>.aicr-bak).
+
+It never clobbers a local edit. The state file keeps a hash of what aicr last
+wrote to each owned file and block. If a target no longer matches that hash,
+someone edited it there:
+  - source unchanged -> the edit is imported into the source folder
+  - source changed too -> conflict: the edit is saved next to its source as
+    <source>.conflict-<machine>-<date>, then the source version is written
+Text matching an [import] deny pattern is never imported.
+
+`aicr watch` re-renders within seconds of a change to an owned file or the
+source folder, and optionally runs a command after each render (commit, push).
 """
 
 from __future__ import annotations
@@ -12,12 +23,16 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +43,7 @@ CONFIG_NAME = "aicr.toml"
 DEFAULT_MACHINE = Path("~/.config/aicr/machine.toml")
 DEFAULT_STATE = "~/.config/aicr/state.json"
 VAR = re.compile(r"\$\{(\w+)\}")
+SKIP_NAMES = re.compile(r"__pycache__|\.aicr-(bak|tmp)|\.conflict-")
 
 # A target is data. `mcp.format` is "json" (servers under `mcp.key`, default
 # "mcpServers") or "toml" (servers under [mcp_servers.<name>]). Any field can be
@@ -103,19 +119,62 @@ def applies(entry: dict[str, Any], target: str, machine: str) -> bool:
     return "machines" not in entry or machine in entry["machines"]
 
 
+def sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
 @dataclass
 class Writer:
     dry: bool
-    stamp: str = field(default_factory=lambda: dt.datetime.now().astimezone().strftime("%Y%m%d%H%M%S"))
+    last: dict[str, str] = field(default_factory=dict)  # key -> hash of what we wrote last run
+    host: str = "machine"
+    deny: list[re.Pattern[str]] = field(default_factory=list)  # never import text that matches
     changes: list[tuple[Path, str | None, str | None]] = field(default_factory=list)
     pending: dict[Path, str] = field(default_factory=dict)  # what a dry run would have written
+    rendered: dict[str, str] = field(default_factory=dict)
+    imported: list[tuple[str, Path]] = field(default_factory=list)
+    conflicts: list[tuple[str, Path]] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
+
+    def guard(self, key: str, cur: bytes | None, new: bytes, src: Path | None, label: str) -> bytes:
+        """Return what the target should hold. A local edit is imported into src, or saved next to it as a conflict."""
+        last = self.last.get(key)
+        if cur is None or cur == new or sha(cur) == last:
+            self.rendered[key] = sha(new)
+            return new
+        denied = any(rx.search(cur.decode("utf-8", "replace")) for rx in self.deny)
+        if last is not None and sha(new) == last:  # only the target changed
+            if src is None or denied:
+                self.flags.append(
+                    f"local edit to {label} not imported ({'denied text' if denied else 'templated source'}); target kept"
+                )
+                self.rendered[key] = last  # keep reporting it until someone resolves it
+                return cur
+            self.imported.append((label, src))
+            if not self.dry:
+                src.write_bytes(cur)
+            self.rendered[key] = sha(cur)
+            return cur
+        # Both changed, or no record of what we wrote: keep the local copy next to the source, then write the source.
+        if src is None or denied:
+            self.flags.append(f"local edit to {label} overwritten, not saved ({'denied text' if denied else 'templated source'})")
+        else:
+            day = dt.datetime.now().astimezone().strftime("%Y%m%d")
+            dst = src.with_name(f"{src.name}.conflict-{self.host}-{day}")
+            self.conflicts.append((label, dst))
+            if not self.dry:
+                dst.write_bytes(cur)
+        self.rendered[key] = sha(new)
+        return new
 
     def read(self, p: Path) -> str | None:
         return self.pending.get(p, p.read_text(encoding="utf-8") if p.exists() else None)
 
     def backup(self, p: Path) -> None:
         if p.exists() and not self.dry:
-            dst = p.with_name(f"{p.name}.aicr-bak-{self.stamp}")
+            dst = p.with_name(f"{p.name}.aicr-bak")
+            if dst.is_dir():
+                shutil.rmtree(dst)
             if p.is_dir():
                 shutil.copytree(p, dst)
             else:
@@ -135,14 +194,16 @@ class Writer:
         tmp.write_text(new, encoding="utf-8", newline="")
         os.replace(tmp, p)
 
-    def copy(self, src: Path, dst: Path) -> None:
-        if dst.exists() and dst.read_bytes() == src.read_bytes():
+    def copy(self, src: Path, dst: Path, label: str) -> None:
+        have = dst.read_bytes() if dst.exists() else None
+        want = self.guard(str(dst), have, src.read_bytes(), src, label)
+        if have == want:
             return
         self.changes.append((dst, None, None))
         if not self.dry:
             self.backup(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            dst.write_bytes(want)
 
     def remove(self, p: Path) -> None:
         if not p.exists():
@@ -162,6 +223,12 @@ class Writer:
 def block_re(name: str) -> re.Pattern[str]:
     n = re.escape(name)
     return re.compile(rf"<!-- aicr:{n} -->\n.*?<!-- /aicr:{n} -->\n?", re.DOTALL)
+
+
+def block_body(text: str, name: str) -> str | None:
+    n = re.escape(name)
+    m = re.search(rf"<!-- aicr:{n} -->\n(.*?)<!-- /aicr:{n} -->", text, re.DOTALL)
+    return m.group(1).rstrip() + "\n" if m else None
 
 
 def render_instructions(text: str, blocks: dict[str, str], dropped: set[str]) -> str:
@@ -269,7 +336,8 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
     state_file = Path(sub(mach.get("state", DEFAULT_STATE), env)).expanduser()
     state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
     new_state: dict[str, Any] = {}
-    w = Writer(dry)
+    deny = [re.compile(p, re.IGNORECASE) for p in cfg.get("import", {}).get("deny", [])]
+    w = Writer(dry, last=state.get("_rendered", {}), host=machine, deny=deny)
     notes: list[str] = []
 
     for tname, raw in targets(cfg).items():
@@ -285,16 +353,26 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
 
         if "instructions" in t:
             blocks: dict[str, str] = {}
+            p = Path(t["instructions"]).expanduser()
             for name, r in cfg.get("rules", {}).items():
                 if not applies(r, tname, machine):
                     continue
                 src = source / "rules" / f"{name}.{tname}.md"
                 src = src if src.exists() else source / "rules" / f"{name}.md"
                 try:
-                    blocks[name] = sub(src.read_text(encoding="utf-8"), env)
+                    rule_text = src.read_text(encoding="utf-8")
+                    body = sub(rule_text, env).rstrip() + "\n"
                 except Missing as e:
                     notes.append(f"{tname}: rule {name} skipped, no var {e}")
-            p = Path(t["instructions"]).expanduser()
+                    continue
+                have = block_body(w.read(p) or "", name)
+                blocks[name] = w.guard(
+                    f"{p}#{name}",
+                    have.encode("utf-8") if have is not None else None,
+                    body.encode("utf-8"),
+                    None if VAR.search(rule_text) else src,
+                    f"{tname} rules/{name}",
+                ).decode("utf-8")
             # Two targets can share one file (gemini, antigravity): merge their blocks.
             file_state = new_state.setdefault("_instructions", {}).setdefault(str(p), [])
             dropped = set(prev.get("rules", [])) - blocks.keys() - set(file_state)
@@ -337,8 +415,8 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
             for n in names:
                 skill = source / "skills" / n
                 for f in sorted(skill.rglob("*")) if skill.is_dir() else []:
-                    if f.is_file() and "__pycache__" not in f.parts:
-                        w.copy(f, root / n / f.relative_to(skill))
+                    if f.is_file() and not SKIP_NAMES.search(f.relative_to(skill).as_posix()):
+                        w.copy(f, root / n / f.relative_to(skill), f"{tname} skills/{n}/{f.relative_to(skill).as_posix()}")
             for n in set(prev.get("skills", [])) - set(names):
                 w.remove(root / n)
         cur["skills"] = names
@@ -350,7 +428,17 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
         try:
             dest_p, src = Path(sub(dest, env)).expanduser(), source / sub(f["src"], env)
             data = src.read_text(encoding="utf-8")
-            w.text(dest_p, sub(data, env) if f.get("template", False) else data)
+            templated = f.get("template", False)
+            want = (sub(data, env) if templated else data).encode("utf-8")
+            have = w.read(dest_p)
+            got = w.guard(
+                str(dest_p),
+                have.encode("utf-8") if have is not None else None,
+                want,
+                None if templated else src,
+                f"file {f['src']}",
+            )
+            w.text(dest_p, got.decode("utf-8"))
         except Missing as e:
             notes.append(f"file {dest} skipped, no var {e}")
             continue
@@ -358,6 +446,7 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
     for gone in set(state.get("_files", [])) - set(owned_files):
         w.remove(Path(gone))
     new_state["_files"] = owned_files
+    new_state["_rendered"] = w.rendered
     new_state.pop("_instructions", None)
 
     if not dry:
@@ -366,16 +455,100 @@ def render(source: Path, machine_file: Path, dry: bool) -> tuple[Writer, list[st
     return w, notes
 
 
+# ---------- watch ----------
+
+
+def watched(source: Path, machine_file: Path) -> list[Path]:
+    """Every file aicr owns on this machine, plus the source tree."""
+    _, mach, env = load(source, machine_file)
+    state_file = Path(sub(mach.get("state", DEFAULT_STATE), env)).expanduser()
+    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    files = {Path(k.split("#")[0]) for k in state.get("_rendered", {})}
+    files |= {p for p in source.rglob("*") if ".git" not in p.relative_to(source).parts}
+    return sorted(files)
+
+
+def snapshot(files: list[Path]) -> dict[Path, tuple[int, int]]:
+    out = {}
+    for f in files:
+        try:
+            st = f.stat()
+            out[f] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            pass
+    return out
+
+
+def git(source: Path, *args: str) -> str:
+    r = subprocess.run(["git", "-C", str(source), *args], capture_output=True, text=True, check=False)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def watch(
+    source: Path,
+    machine_file: Path,
+    run: Callable[[], None],
+    interval: float = 1.0,
+    settle: float = 2.0,
+    remote_every: float = 0.0,
+    rounds: int | None = None,
+) -> None:
+    """Call `run` once a burst of changes to owned files or the source tree has been quiet for `settle` seconds.
+    With remote_every > 0 and a git source, also pull and run when the upstream branch moves.
+    Our own writes do not loop: the snapshot is retaken after each run.
+    ponytail: polls stat() of the owned files every `interval` s, identical on Windows, macOS and Linux;
+    switch to inotify/FSEvents/ReadDirectoryChangesW if the owned set grows to many thousands of files."""
+    files = watched(source, machine_file)
+    seen = snapshot(files)
+    dirty_since: float | None = None
+    next_remote = time.monotonic()
+    n = 0
+    while rounds is None or n < rounds:
+        n += 1
+        time.sleep(interval)
+        now = time.monotonic()
+        cur = snapshot(files)
+        if cur != seen:
+            seen, dirty_since = cur, now
+        trigger = dirty_since is not None and now - dirty_since >= settle
+        if not trigger and remote_every > 0 and now >= next_remote:
+            next_remote = now + remote_every
+            remote = git(source, "ls-remote", "origin", "HEAD").split()
+            if remote and remote[0] != git(source, "rev-parse", "HEAD"):
+                trigger = bool(git(source, "pull", "--ff-only", "-q") or True)
+        if trigger:
+            run()
+            files = watched(source, machine_file)
+            seen, dirty_since = snapshot(files), None
+
+
 # ---------- CLI ----------
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="aicr", description=(__doc__ or "").splitlines()[0])
-    ap.add_argument("command", choices=["render", "diff", "check", "list-targets"])
+    ap.add_argument("command", choices=["render", "diff", "check", "list-targets", "watch"])
     ap.add_argument("--source", type=Path, default=Path("."), help=f"folder with {CONFIG_NAME} (default: .)")
     ap.add_argument("--machine", type=Path, default=DEFAULT_MACHINE, help="per-machine vars file")
+    ap.add_argument(
+        "--exec", dest="exec_cmd", help="watch: shell command to run after each render, e.g. a commit-and-push script"
+    )
+    ap.add_argument("--remote-every", type=float, default=0.0, help="watch: seconds between upstream checks (0 = off)")
     a = ap.parse_args(argv)
     machine = a.machine.expanduser()
+
+    if a.command == "watch":
+
+        def run() -> None:
+            stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            w, notes = render(a.source, machine, dry=False)
+            for line in report(w, notes):
+                print(f"{stamp} {line}", flush=True)
+            if a.exec_cmd:
+                subprocess.run(a.exec_cmd, shell=True, cwd=a.source, check=False)  # noqa: S602 - the user's own command
+
+        watch(a.source, machine, run, remote_every=a.remote_every)
+        return 0
 
     if a.command == "list-targets":
         cfg = tomllib.loads((a.source / CONFIG_NAME).read_text(encoding="utf-8")) if (a.source / CONFIG_NAME).exists() else {}
@@ -392,6 +565,16 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.writelines(difflib.unified_diff((old or "").splitlines(True), new.splitlines(True), f"a/{p}", f"b/{p}"))
         else:
             print(f"{'removed' if old == '' and new is None else 'changed'} {p}")
-    for n in notes:
-        print(f"note: {n}", file=sys.stderr)
-    return 1 if a.command == "check" and w.changes else 0
+    for line in report(w, notes)[len(w.changes) :]:
+        print(line, file=sys.stderr)
+    return 1 if a.command == "check" and (w.changes or w.conflicts or w.flags) else 0
+
+
+def report(w: Writer, notes: list[str]) -> list[str]:
+    return (
+        [f"{'removed' if old == '' and new is None else 'changed'} {p}" for p, old, new in w.changes]
+        + [f"imported: {label} -> {p}" for label, p in w.imported]
+        + [f"CONFLICT: {label}: local edit saved as {p}" for label, p in w.conflicts]
+        + [f"FLAG: {f}" for f in w.flags]
+        + [f"note: {n}" for n in notes]
+    )

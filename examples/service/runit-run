@@ -1,0 +1,9 @@
+#!/bin/sh
+# runit service for distros without systemd (Void, KISS, Artix).
+# Install as root: mkdir /etc/sv/aicr-watch.USER && cp runit-run /etc/sv/aicr-watch.USER/run
+#   && chmod +x /etc/sv/aicr-watch.USER/run && ln -s /etc/sv/aicr-watch.USER /var/service/
+# Replace USER below with your login name.
+USER=user
+HOME=/home/$USER
+exec chpst -u "$USER:$USER" env HOME="$HOME" PATH="$HOME/.local/bin:/usr/bin:/bin" \
+	aicr watch --source "$HOME/ai-config" --remote-every 20 --exec "sh commit-and-push.sh" 2>&1

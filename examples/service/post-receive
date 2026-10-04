@@ -1,0 +1,17 @@
+#!/bin/sh
+# Git post-receive hook for the bare repo that holds your aicr source.
+# Tells every other machine to pull and render right away, so `aicr watch
+# --remote-every` polling is only a fallback.
+#
+# Install: copy to <bare repo>/hooks/post-receive, chmod +x, and list one SSH
+# destination per line in <bare repo>/aicr-notify (for example user@laptop).
+# Each machine needs a command that pulls and renders, for example:
+#   git -C ~/ai-config pull --ff-only -q && aicr render --source ~/ai-config
+# Restrict the key with command="..." in that machine's authorized_keys.
+hosts=$(dirname "$0")/../aicr-notify
+[ -f "$hosts" ] || exit 0
+while read -r host; do
+	case $host in '' | '#'*) continue ;; esac
+	ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" aicr-pull </dev/null >/dev/null 2>&1 &
+done <"$hosts"
+exit 0

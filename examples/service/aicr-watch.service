@@ -1,0 +1,12 @@
+# systemd user service: re-render on every local edit, pull on upstream changes.
+# Install: cp aicr-watch.service ~/.config/systemd/user/ && systemctl --user enable --now aicr-watch
+[Unit]
+Description=aicr watch: keep AI agent configs in sync
+
+[Service]
+ExecStart=%h/.local/bin/aicr watch --source %h/ai-config --remote-every 20 --exec "sh commit-and-push.sh"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
